@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connection security status</title>
+<style>
+  :root { --ink:#1f2933; --sub:#6b7785; --line:#e3e8ee; --bg:#f4f6f9; --good:#16a34a; --warn:#d97706; --bad:#dc2626; --brand:#2563eb; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font-family:-apple-system,"Hiragino Sans","Noto Sans JP",sans-serif; line-height:1.6; }
+  header { background:#fff; border-bottom:1px solid var(--line); padding:16px 28px; display:flex; align-items:center; gap:14px; }
+  header h1 { margin:0; font-size:19px; } header p { margin:0; color:var(--sub); font-size:12.5px; }
+  header .right { margin-left:auto; text-align:right; font-size:12px; color:var(--sub); }
+  main { max-width:980px; margin:22px auto; padding:0 20px; display:grid; grid-template-columns:1fr 1fr; gap:18px; }
+  @media (max-width:800px){ main { grid-template-columns:1fr; } }
+  .card { background:#fff; border:1px solid var(--line); border-radius:14px; padding:18px 20px; }
+  .wide { grid-column:1 / -1; }
+  .stale .card { opacity:.45; filter:grayscale(.6); }   /* when loading fails, make it obvious that the display is stale */
+  h2 { margin:0 0 10px; font-size:14px; color:var(--sub); font-weight:600; }
+  .big { font-size:22px; font-weight:800; display:flex; align-items:center; gap:10px; }
+  .dot { width:14px; height:14px; border-radius:50%; background:var(--good); flex:0 0 auto; } .dot.bad { background:var(--bad); } .dot.warn { background:var(--warn); }
+  .kv { display:grid; grid-template-columns:120px 1fr; gap:4px 10px; margin-top:12px; font-size:13.5px; } .kv span:nth-child(odd) { color:var(--sub); }
+  .sub { color:var(--sub); font-size:12.5px; margin-top:8px; }
+  svg text { font-family:inherit; }
+  table { width:100%; border-collapse:collapse; font-size:13px; } th, td { text-align:left; padding:7px 8px; border-top:1px solid var(--line); } th { color:var(--sub); font-weight:600; border-top:0; }
+  .tag { font-size:11.5px; padding:2px 8px; border-radius:999px; font-weight:600; } .tag.restart { background:#dbeafe; color:#1e40af; } .tag.unknown { background:#fef3c7; color:#92400e; }
+  details { font-size:13px; } summary { cursor:pointer; font-weight:600; } pre { background:#1f2430; color:#e8e8e8; padding:12px 14px; border-radius:8px; overflow:auto; font-size:12px; line-height:1.55; }
+  #err { display:none; grid-column:1 / -1; background:#fee2e2; border:1px solid #fca5a5; color:#991b1b; padding:10px 14px; border-radius:10px; font-size:13px; }
+  button { font:inherit; border:0; background:#eef2f7; border-radius:8px; padding:6px 12px; cursor:pointer; }
+</style>
+<script src="config.js"></script>
+</head>
+<body>
+<header>
+  <div><h1>Connection security status</h1><p>Is the database connection encrypted, when did it last restart, and was there any downtime?</p></div>
+  <div class="right"><div id="updated">Loading...</div><button id="reload">Refresh now</button></div>
+</header>
+<main>
+  <div id="err"></div>
+  <section class="card" id="conn"></section>
+  <section class="card" id="uptime"></section>
+  <section class="card wide" id="beat"></section>
+  <section class="card wide" id="gaps"></section>
+  <section class="card wide">
+    <details>
+      <summary>Check it yourself (test of connections from outside)</summary>
+      <p class="sub">This page only looks at the <b>connection from the app (Edge Function) to the database</b>. Connections from outside, such as <code>psql</code>, are separate, so check them with the script below (it uses a deliberately wrong password).</p>
+<pre>export PGHOST="aws-0-&lt;region&gt;.pooler.supabase.com"
+export PGUSER="postgres.&lt;PROJECT_REF&gt;"
+./scripts/check-ssl.sh
+# If SSL is enforced: sslmode=disable is refused with (ESSLREQUIRED)</pre>
+    </details>
+  </section>
+</main>
+<script>
+const cfg = window.APP_CONFIG
+const $ = (id) => document.getElementById(id)
+const showErr = (m) => { $('err').style.display = m ? 'block' : 'none'; $('err').textContent = m || '' }
+if (!cfg || !cfg.SUPABASE_URL || !cfg.SUPABASE_PUBLISHABLE_KEY) {
+  showErr('config.js is missing. Copy config.example.js and fill in the values.'); throw new Error('config.js is missing')
+}
+const localTime = (iso) => new Date(iso).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'medium' })   // the viewer's own time zone
+const hhmm = (iso) => new Date(iso).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
+const dur = (sec) => sec >= 86400 ? `${Math.floor(sec / 86400)}d ${Math.floor(sec % 86400 / 3600)}h` : sec >= 3600 ? `${Math.floor(sec / 3600)}h ${Math.floor(sec % 3600 / 60)}min` : sec >= 60 ? `${Math.floor(sec / 60)}min ${Math.floor(sec % 60)}s` : `${Math.floor(sec)}s`
+
+let lastOk = null
+async function load() {
+  // Keep the previous error/stale marking while a new call is in flight, and give up after 10 s:
+  // during a restart the call can hang, and without a timeout the page would keep showing the last good (green) data with no warning.
+  try {
+    const res = await fetch(`${cfg.SUPABASE_URL}/functions/v1/security-status`, { method: 'POST', headers: { 'Content-Type': 'application/json', apikey: cfg.SUPABASE_PUBLISHABLE_KEY }, body: '{}', signal: AbortSignal.timeout(10000) })
+    const d = await res.json(); if (!res.ok) throw new Error(d.error || `HTTP ${res.status}`)
+    showErr(''); document.querySelector('main').classList.remove('stale')
+    render(d); lastOk = new Date(); $('updated').textContent = 'Updated: ' + lastOk.toLocaleTimeString()
+  } catch (e) {
+    const why = e.name === 'TimeoutError' ? 'no answer within 10 seconds' : e.message
+    showErr('Could not read the status: ' + why + (lastOk ? `. The display below is stale (as of ${lastOk.toLocaleTimeString()}).` : ''))
+    if (lastOk) document.querySelector('main').classList.add('stale')
+  }
+}
+
+function render(d) {
+  const c = d.connection
+  $('conn').innerHTML = c && c.ssl
+    ? `<h2>App -> database connection</h2><div class="big"><span class="dot"></span>Encrypted</div>
+       <div class="kv"><span>TLS version</span><span>${c.tls_version}</span><span>Cipher</span><span>${c.cipher}</span><span>Key length</span><span>${c.bits} bit</span></div>
+       <div class="sub">This is the answer from the database itself (pg_stat_ssl) about the connection this function uses.</div>`
+    : `<h2>App -> database connection</h2><div class="big"><span class="dot bad"></span>Not encrypted</div><div class="sub">Check your SSL settings.</div>`
+
+  const start = new Date(d.database.started_at), now = new Date(d.database.now)
+  const up = (now - start) / 1000
+  $('uptime').innerHTML = `<h2>Database uptime</h2><div class="big"><span class="dot ${up < 300 ? 'warn' : ''}"></span>Up ${dur(up)}</div>
+    <div class="kv"><span>Last restart</span><span>${localTime(d.database.started_at)} (your local time)</span><span>Postgres</span><span>${d.database.server_version}</span></div>
+    <div class="sub">${up < 300 ? 'It restarted only a moment ago.' : 'If it restarts (for example after a settings change), this time is updated.'}</div>`
+
+  // Last 60 minutes as one bar per minute (a 10-second job gives about 6 per minute)
+  const byMin = new Map(d.perMinute.map((r) => [new Date(r.minute).getTime(), r.runs]))
+  const endMin = Math.floor(now.getTime() / 60000) * 60000
+  let bars = []; for (let i = 59; i >= 0; i--) { const t = endMin - i * 60000; bars.push({ t, runs: byMin.get(t) ?? 0 }) }
+  // Minutes before the job's first run are "no data", not "down": drop them instead of drawing them red
+  const firstT = Math.min(...byMin.keys())
+  if (Number.isFinite(firstT)) bars = bars.filter((b) => b.t >= firstT)
+  const n = bars.length
+  const incomplete = bars.slice(0, n - 1).filter((b) => b.runs < 6).length   // don't count the current (partial) minute
+  const W = 880, H = 120, bw = W / 60
+  const color = (r, last) => last ? '#93c5fd' : r >= 6 ? '#16a34a' : r > 0 ? '#d97706' : '#dc2626'
+  $('beat').innerHTML = `<h2>Scheduled job (cron) runs: last 60 minutes</h2>
+    <svg viewBox="0 0 ${W} ${H + 24}" width="100%" role="img" aria-label="cron runs per minute">
+      ${bars.map((b, i) => `<rect x="${(60 - n + i) * bw + 1}" y="${H - Math.min(b.runs, 6) / 6 * H}" width="${bw - 2}" height="${Math.max(Math.min(b.runs, 6) / 6 * H, 3)}" rx="2" fill="${color(b.runs, i === n - 1)}"><title>${hhmm(new Date(b.t).toISOString())}: ${b.runs} runs</title></rect>`).join('')}
+      <text x="${(60 - n) * bw}" y="${H + 18}" font-size="11" fill="#6b7785">${hhmm(new Date(bars[0].t).toISOString())}</text>
+      <text x="${W}" y="${H + 18}" font-size="11" fill="#6b7785" text-anchor="end">now</text>
+    </svg>
+    <div class="sub">Bar height = runs in that minute (a 10-second job gives about 6). Green = 6, orange = only some, red = 0, light blue = the current (partial) minute. ${incomplete === 0 ? 'Every minute in the last 60 has all 6 runs.' : `${incomplete} minute(s) did not reach 6 (sometimes just a small timing shift; a minute with 0 runs suggests it was probably down).`}</div>`
+
+  const rows = d.gaps.map((g) => {
+    const restarted = start >= new Date(g.from_ts) && start <= new Date(g.to_ts)
+    return `<tr><td>${localTime(g.from_ts)}</td><td>${localTime(g.to_ts)}</td><td>${dur(g.seconds)}</td><td><span class="tag ${restarted ? 'restart' : 'unknown'}">${restarted ? 'Database restart' : 'Cause unknown (job stopped or recreated, etc.)'}</span></td></tr>`
+  }).join('')
+  $('gaps').innerHTML = `<h2>Downtime windows (last 72 hours, gaps longer than ${d.gapThresholdSeconds} seconds)</h2>` +
+    (d.gaps.length ? `<table><thead><tr><th>From</th><th>To</th><th>Length</th><th>Estimated cause</th></tr></thead><tbody>${rows}</tbody></table>
+      <div class="sub">A gap is labelled "restart" only if the last start time falls inside it. Earlier restarts show as "unknown" because their start times are not recorded.</div>` : `<div class="sub">No gaps.</div>`)
+}
+$('reload').onclick = load; load(); setInterval(load, 30000)
+</script>
+</body>
+</html>
